@@ -78,6 +78,10 @@ assay:
     # Directory with one TSV per sample: <sample>.tsv
     # Required columns: CHROM, POS, REF, ALT
     calls_dir: "workflow/resources/orthogonal_calls"
+    varscan:
+      enabled: false
+      min_var_freq: 0.005
+      p_value: 0.05
 
   chip:
     enabled: false
@@ -96,6 +100,28 @@ clinical_annotations:
   enabled: false
   # TSV with columns: CHROM, POS, REF, ALT, GENE, CLINICAL_TIER, ACTIONABILITY
   panel_tsv: "workflow/resources/clinical_annotations.tsv"
+  clinvar_cosmic_tsv: "workflow/resources/clinvar_cosmic.tsv"
+
+annotation:
+  snpeff:
+    enabled: false
+    database: "GRCh38.99"
+
+pbmc_blacklist:
+  enabled: false
+  calls_dir: "workflow/resources/pbmc_calls"
+  max_vaf: 0.2
+  min_recurrence: 2
+  fail_on_match: true
+
+tumor_informed:
+  enabled: false
+  # Per-sample known tumor variants TSV: <sample>.tsv with CHROM,POS,REF,ALT
+  known_variants_dir: "workflow/resources/tumor_informed_calls"
+  # Keep only variants observed in the known set.
+  require_known: true
+  # Fail if enabled but <sample>.tsv is missing.
+  fail_on_missing_known: true
 
 clinical_output:
   enabled: true
@@ -103,6 +129,12 @@ clinical_output:
   accepted_support_gates: ["PASS", "REVIEW"]
   # If true, keep only clinically annotated rows.
   include_only_annotated: false
+
+clinical_release:
+  enabled: true
+  require_qc_pass: true
+  require_manifest_git_sha: true
+  require_variants: false
 
 # ============================================================
 # Pair integrity and repair

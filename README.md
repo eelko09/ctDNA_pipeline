@@ -114,6 +114,26 @@ Configured in `workflow/config.yaml`:
   - optional `clinical_output.include_only_annotated: true`
   - output table: `results/variants/{sample}.clinical.tsv`
 
+## Optional tumor-informed mode (P0 scaffold)
+
+- Enable `tumor_informed.enabled: true`
+- Provide `tumor_informed.known_variants_dir/<sample>.tsv` with:
+  - `CHROM`, `POS`, `REF`, `ALT`
+- Controls:
+  - `tumor_informed.require_known` (keep only known tissue variants)
+  - `tumor_informed.fail_on_missing_known`
+- Output:
+  - `results/variants/{sample}.clinical.tumor_informed.tsv`
+
+## Clinical release gating (P0 scaffold)
+
+- Configure `clinical_release.*`:
+  - `require_qc_pass`
+  - `require_manifest_git_sha`
+  - `require_variants`
+- Output:
+  - `results/reports/clinical_release_gate.tsv`
+
 ## Validation and regression checks
 
 - Config/schema validation:

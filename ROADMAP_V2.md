@@ -1,33 +1,26 @@
 # ctDNA Pipeline v2 Roadmap
 
-## Phase 1: Robust Calling Modes (Now Scaffolded)
-- Add configurable `variant_calling.mode`:
-  - `tumor_only`
-  - `tumor_normal`
-  - `auto`
-- Use `samples.tsv` metadata (`type`, `normal_sample`) to drive called sample selection.
-- Enforce validation for `tumor_normal` mode (no missing/unknown matched normals).
+## P0: Clinical-readiness baseline (In Progress)
+- Implemented:
+  - Calling modes (`tumor_only`, `tumor_normal`, `auto`)
+  - ctDNA hard postfilter over `FilterMutectCalls`
+  - QC gates and LOD-by-bin report scaffolding
+  - Optional WBC/PBMC filtering
+  - Optional VarScan cross-check and SnpEff annotation
+  - Optional tumor-informed filter (`tumor_informed.*`)
+  - Clinical release gate report (`results/reports/clinical_release_gate.tsv`)
+- Remaining P0:
+  - Add explicit sensitivity/precision regression assertions from workflow outputs
+  - Add strict CI smoke run for non-dry-run test fixture
 
-## Phase 2: ctDNA-Oriented Postfilters (Now Scaffolded)
-- Keep `FilterMutectCalls` as probabilistic filter.
-- Add configurable hard postfilter (`min_dp`, `min_alt_reads`, `min_af`, `pass_only`).
-- Emit a final VCF target (`*.filtered.final.vcf.gz`) for downstream reporting.
+## P1: Molecule-aware error suppression
+- Add SSCS consensus path for UMI assays (fgbio/UMI-tools consensus stage).
+- Add duplex consensus (DCS) path where assay supports it.
+- Gate on consensus molecule metrics (not just read-level DP/AF).
+- Add strand/read-position/bias artifacts into release gate.
 
-## Phase 3: Objective QC Gates (Now Scaffolded)
-- Add configurable QC gates:
-  - minimum mapped percentage
-  - minimum mean panel coverage
-  - maximum duplication fraction
-  - maximum contamination
-- Emit `results/reports/qc_gates.tsv` with per-sample gate outcomes and overall pass/fail.
-
-## Phase 4: Validation and Regression Testing (Next)
-- Add CI dry run:
-  - `snakemake -n -s workflow/Snakefile --configfile workflow/config.yaml`
-- Add config/schema tests for expected keys and value ranges.
-- Add one synthetic low-VAF truth set and assert expected sensitivity bins.
-
-## Phase 5: Assay-Specific Enhancements (Next)
-- Add UMI-aware branch (`fgbio`/`umi-tools`) for UMI assays.
-- Add optional orthogonal caller cross-check and consensus flagging.
-- Add CHIP-focused postfilter/annotation panel for common hematopoietic genes.
+## P2: Clinical interpretation depth
+- Add optional OncoKB/CIViC/AMP tier mapping inputs.
+- Add transcript/HGVS normalization and canonical transcript policy.
+- Add tumor-informed MRD mode with patient-specific panel generation support.
+- Add longitudinal ctDNA trend reporting and reproducibility dashboards.

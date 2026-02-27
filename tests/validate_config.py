@@ -108,6 +108,24 @@ def validate_assay(cfg):
             fail("assay.orthogonal.enabled must be boolean")
         if "calls_dir" in orth and not isinstance(orth["calls_dir"], str):
             fail("assay.orthogonal.calls_dir must be a string path")
+        varscan = orth.get("varscan", {})
+        if varscan:
+            if "enabled" in varscan and not isinstance(varscan["enabled"], bool):
+                fail("assay.orthogonal.varscan.enabled must be boolean")
+            if "min_var_freq" in varscan:
+                mvf = varscan["min_var_freq"]
+                require_positive_number(
+                    mvf, "assay.orthogonal.varscan.min_var_freq", allow_zero=True
+                )
+                if mvf >= 1:
+                    fail("assay.orthogonal.varscan.min_var_freq must be < 1")
+            if "p_value" in varscan:
+                pval = varscan["p_value"]
+                require_positive_number(
+                    pval, "assay.orthogonal.varscan.p_value", allow_zero=True
+                )
+                if pval > 1:
+                    fail("assay.orthogonal.varscan.p_value must be <= 1")
 
     chip = assay.get("chip", {})
     if chip:
@@ -136,6 +154,67 @@ def validate_clinical_annotations(cfg):
         fail("clinical_annotations.enabled must be boolean")
     if "panel_tsv" in ann and not isinstance(ann["panel_tsv"], str):
         fail("clinical_annotations.panel_tsv must be a string path")
+    if "clinvar_cosmic_tsv" in ann and not isinstance(ann["clinvar_cosmic_tsv"], str):
+        fail("clinical_annotations.clinvar_cosmic_tsv must be a string path")
+
+
+def validate_annotation(cfg):
+    ann = cfg.get("annotation", {})
+    if not ann:
+        return
+    snpeff = ann.get("snpeff", {})
+    if snpeff:
+        if "enabled" in snpeff and not isinstance(snpeff["enabled"], bool):
+            fail("annotation.snpeff.enabled must be boolean")
+        if "database" in snpeff and not isinstance(snpeff["database"], str):
+            fail("annotation.snpeff.database must be a string")
+
+
+def validate_pbmc_blacklist(cfg):
+    pbmc = cfg.get("pbmc_blacklist", {})
+    if not pbmc:
+        return
+    if "enabled" in pbmc and not isinstance(pbmc["enabled"], bool):
+        fail("pbmc_blacklist.enabled must be boolean")
+    if "calls_dir" in pbmc and not isinstance(pbmc["calls_dir"], str):
+        fail("pbmc_blacklist.calls_dir must be a string path")
+    if "max_vaf" in pbmc:
+        max_vaf = pbmc["max_vaf"]
+        require_positive_number(pbmc["max_vaf"], "pbmc_blacklist.max_vaf", allow_zero=True)
+        if max_vaf > 1:
+            fail("pbmc_blacklist.max_vaf must be <= 1")
+    if "min_recurrence" in pbmc:
+        recurrence = pbmc["min_recurrence"]
+        if not isinstance(recurrence, int) or recurrence < 1:
+            fail("pbmc_blacklist.min_recurrence must be an integer >= 1")
+    if "fail_on_match" in pbmc and not isinstance(pbmc["fail_on_match"], bool):
+        fail("pbmc_blacklist.fail_on_match must be boolean")
+
+
+def validate_tumor_informed(cfg):
+    ti = cfg.get("tumor_informed", {})
+    if not ti:
+        return
+    if "enabled" in ti and not isinstance(ti["enabled"], bool):
+        fail("tumor_informed.enabled must be boolean")
+    if "known_variants_dir" in ti and not isinstance(ti["known_variants_dir"], str):
+        fail("tumor_informed.known_variants_dir must be a string path")
+    if "require_known" in ti and not isinstance(ti["require_known"], bool):
+        fail("tumor_informed.require_known must be boolean")
+    if "fail_on_missing_known" in ti and not isinstance(
+        ti["fail_on_missing_known"], bool
+    ):
+        fail("tumor_informed.fail_on_missing_known must be boolean")
+
+
+def validate_clinical_release(cfg):
+    rel = cfg.get("clinical_release", {})
+    if not rel:
+        return
+    keys = ["enabled", "require_qc_pass", "require_manifest_git_sha", "require_variants"]
+    for key in keys:
+        if key in rel and not isinstance(rel[key], bool):
+            fail(f"clinical_release.{key} must be boolean")
 
 
 def validate_clinical_output(cfg):
@@ -227,6 +306,10 @@ def validate_config(path):
     validate_clinical_gates(cfg)
     validate_lod(cfg)
     validate_clinical_annotations(cfg)
+    validate_annotation(cfg)
+    validate_pbmc_blacklist(cfg)
+    validate_tumor_informed(cfg)
+    validate_clinical_release(cfg)
     validate_clinical_output(cfg)
     validate_pair_repair(cfg)
     print(f"OK: {path}")

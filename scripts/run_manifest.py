@@ -44,6 +44,8 @@ def main():
                 "qc_gates": True,
                 "lod_by_bin": True,
                 "variant_support_gates": True,
+                "tumor_informed_filter": True,
+                "clinical_release_gate": True,
             },
         },
     }
