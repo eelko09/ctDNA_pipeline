@@ -18,6 +18,8 @@ tests/results/
 data/
 data_next/
 ref/
+!tests/ref/
+!tests/ref/**
 
 # Common bioinformatics outputs
 *.bam
