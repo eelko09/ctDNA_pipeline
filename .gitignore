@@ -1,0 +1,39 @@
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Snakemake runtime/cache
+.snakemake/
+
+# Pipeline outputs and local runs
+logs/
+results/
+tests/logs/
+tests/results/
+
+# Local/large input data (keep small fixtures in tests/data)
+data/
+data_next/
+ref/
+
+# Common bioinformatics outputs
+*.bam
+*.bai
+*.cram
+*.crai
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
+*.g.vcf
+*.g.vcf.gz
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.sra
+
+# Misc run artifacts
+fastp.json

@@ -1,0 +1,1318 @@
+############################################
+# ctDNA / cfDNA Pipeline (Snakefile)
+# Improved production-ready version
+#
+# Workflow:
+#   FASTQ QC -> Trim -> Align -> RG -> Sort -> MarkDup
+#   -> Alignment QC -> BQSR -> Mutect2 -> OrientationModel
+#   -> Pileups -> Contamination -> FilterMutectCalls
+#   -> Variant table + QC table + Coverage + MultiQC + HTML report
+#
+# Notes:
+# - TESTING mode swaps data/results/logs into tests/
+# - Uses consistent LOGS_DIR
+# - Adds mosdepth coverage + samtools stats
+# - Adds MultiQC + a final per-sample HTML report
+# - Adds benchmarks for heavy rules
+############################################
+
+import os
+import json
+import pandas as pd
+from pathlib import Path
+
+configfile: "workflow/config.yaml"
+
+# ------------------------------------------------------------
+# Runtime paths
+# ------------------------------------------------------------
+TESTING = config.get("testing", False)
+DATA_DIR = "data" if not TESTING else "tests/data"
+RESULTS_DIR = "results" if not TESTING else "tests/results"
+LOGS_DIR = "logs" if not TESTING else "tests/logs"
+BENCH_DIR = os.path.join(RESULTS_DIR, "benchmarks")
+SAMPLES_TSV = config["samples_tsv"]
+
+# ------------------------------------------------------------
+# References
+# ------------------------------------------------------------
+REF_FASTA = config["references"]["reference_fasta"]
+DBSNP_VCF = config["references"]["known_sites"]["dbsnp"]
+MILLS_VCF = config["references"]["known_sites"]["mills_indels"]
+PON_VCF = config["references"]["pon_vcf"]
+PANEL_BED = config["references"]["panel_bed"]
+BLACKLIST_BED = config["references"]["blacklist_bed"]
+GERMLINE_RESOURCE = config["references"]["germline_resource"]
+COMMON_VARIANTS = config["references"]["common_variants"]
+
+# ------------------------------------------------------------
+# Calling/QC policy
+# ------------------------------------------------------------
+VARIANT_CALLING = config.get("variant_calling", {})
+CALLING_MODE = str(VARIANT_CALLING.get("mode", "tumor_only")).strip().lower()
+MUTECT2_SETTINGS = VARIANT_CALLING.get("mutect2", {})
+POSTFILTER_SETTINGS = VARIANT_CALLING.get("postfilter", {})
+QC_GATES = config.get("qc_gates", {})
+ASSAY_CFG = config.get("assay", {})
+UMI_CFG = ASSAY_CFG.get("umi", {})
+ORTHO_CFG = ASSAY_CFG.get("orthogonal", {})
+CHIP_CFG = ASSAY_CFG.get("chip", {})
+WBC_CFG = ASSAY_CFG.get("wbc_filter", {})
+UMI_ENABLED = bool(UMI_CFG.get("enabled", False))
+ORTHO_ENABLED = bool(ORTHO_CFG.get("enabled", False))
+CHIP_ENABLED = bool(CHIP_CFG.get("enabled", False))
+WBC_ENABLED = bool(WBC_CFG.get("enabled", False))
+CLINICAL_GATES = config.get("clinical_support_gates", {})
+LOD_CFG = config.get("lod", {})
+CLIN_ANN_CFG = config.get("clinical_annotations", {})
+CLIN_ANN_ENABLED = bool(CLIN_ANN_CFG.get("enabled", False))
+CLIN_OUT_CFG = config.get("clinical_output", {})
+PAIR_REPAIR_CFG = config.get("pair_repair", {})
+PAIR_REPAIR_ENABLED = bool(PAIR_REPAIR_CFG.get("enabled", True))
+
+# ------------------------------------------------------------
+# Samples
+# ------------------------------------------------------------
+# Expected columns: sample, R1_fastq, R2_fastq
+samples_df = pd.read_csv(SAMPLES_TSV, sep="\t")
+
+required_cols = {"sample", "R1_fastq", "R2_fastq"}
+missing = required_cols - set(samples_df.columns)
+if missing:
+    raise ValueError(f"samples.tsv missing columns: {sorted(missing)}")
+
+if samples_df["sample"].duplicated().any():
+    dups = samples_df.loc[samples_df["sample"].duplicated(), "sample"].tolist()
+    raise ValueError(f"Duplicate sample IDs in samples.tsv: {dups}")
+
+SAMPLES = samples_df["sample"].tolist()
+sample_rows = samples_df.set_index("sample")
+
+HAS_SAMPLE_TYPE = "type" in samples_df.columns
+HAS_NORMAL_SAMPLE = "normal_sample" in samples_df.columns
+
+
+def sample_type(sample):
+    if not HAS_SAMPLE_TYPE:
+        return "tumor"
+    value = sample_rows.loc[sample, "type"]
+    if pd.isna(value):
+        return "tumor"
+    return str(value).strip().lower()
+
+
+def sample_normal(sample):
+    if not HAS_NORMAL_SAMPLE:
+        return None
+    value = sample_rows.loc[sample, "normal_sample"]
+    if pd.isna(value):
+        return None
+    value = str(value).strip()
+    if value == "":
+        return None
+    return value
+
+
+if CALLING_MODE not in {"tumor_only", "tumor_normal", "auto"}:
+    raise ValueError(
+        "variant_calling.mode must be one of: tumor_only, tumor_normal, auto"
+    )
+
+TUMOR_SAMPLES = [s for s in SAMPLES if sample_type(s) == "tumor"]
+if not TUMOR_SAMPLES:
+    TUMOR_SAMPLES = SAMPLES[:]
+
+if CALLING_MODE == "tumor_only":
+    CALLED_SAMPLES = SAMPLES[:]
+else:
+    CALLED_SAMPLES = TUMOR_SAMPLES[:]
+
+NORMAL_BY_TUMOR = {}
+for sample in CALLED_SAMPLES:
+    normal = sample_normal(sample)
+    if normal is None:
+        continue
+    if normal not in SAMPLES:
+        raise ValueError(
+            f"samples.tsv normal_sample for {sample!r} points to unknown sample {normal!r}"
+        )
+    NORMAL_BY_TUMOR[sample] = normal
+
+if CALLING_MODE == "tumor_normal":
+    missing_pairs = [s for s in CALLED_SAMPLES if s not in NORMAL_BY_TUMOR]
+    if missing_pairs:
+        raise ValueError(
+            "variant_calling.mode=tumor_normal requires normal_sample for each called "
+            f"tumor sample; missing: {missing_pairs}"
+        )
+
+
+def sample_r1(wc):
+    row = samples_df.loc[samples_df["sample"] == wc.sample].iloc[0]
+    return os.path.join(DATA_DIR, row["R1_fastq"])
+
+
+def sample_r2(wc):
+    row = samples_df.loc[samples_df["sample"] == wc.sample].iloc[0]
+    return os.path.join(DATA_DIR, row["R2_fastq"])
+
+
+def pre_fastp_r1(wc):
+    if UMI_ENABLED:
+        return os.path.join(RESULTS_DIR, "umi", f"{wc.sample}_R1.umi.fastq.gz")
+    return sample_r1(wc)
+
+
+def pre_fastp_r2(wc):
+    if UMI_ENABLED:
+        return os.path.join(RESULTS_DIR, "umi", f"{wc.sample}_R2.umi.fastq.gz")
+    return sample_r2(wc)
+
+
+def align_r1(wc):
+    if PAIR_REPAIR_ENABLED:
+        return os.path.join(RESULTS_DIR, "trimmed", f"{wc.sample}_R1.repaired.fastq.gz")
+    return os.path.join(RESULTS_DIR, "trimmed", f"{wc.sample}_R1.trimmed.fastq.gz")
+
+
+def align_r2(wc):
+    if PAIR_REPAIR_ENABLED:
+        return os.path.join(RESULTS_DIR, "trimmed", f"{wc.sample}_R2.repaired.fastq.gz")
+    return os.path.join(RESULTS_DIR, "trimmed", f"{wc.sample}_R2.trimmed.fastq.gz")
+
+
+def mutect2_normal_bams(wc):
+    normal = NORMAL_BY_TUMOR.get(wc.sample)
+    if normal is None:
+        return []
+    return [os.path.join(RESULTS_DIR, "bam", f"{normal}_bqsr.bam")]
+
+
+def mutect2_normal_bais(wc):
+    normal = NORMAL_BY_TUMOR.get(wc.sample)
+    if normal is None:
+        return []
+    return [os.path.join(RESULTS_DIR, "bam", f"{normal}_bqsr.bam.bai")]
+
+
+def mutect2_normal_args(wc):
+    normal = NORMAL_BY_TUMOR.get(wc.sample)
+    if normal is None:
+        return ""
+    return (
+        f"-I {os.path.join(RESULTS_DIR, 'bam', f'{normal}_bqsr.bam')} "
+        f"--normal-sample {normal}"
+    )
+
+
+# ============================================================
+# Defaults / convenience
+# ============================================================
+# Ensure consistent shell behavior
+shell.executable("bash")
+
+# If running on cluster later, keep 'all' local
+localrules: all
+
+
+# ============================================================
+# Targets
+# ============================================================
+rule all:
+    input:
+        # Reference prep
+        f"{REF_FASTA}.bwt",
+        f"{REF_FASTA}.fai",
+        f"{os.path.splitext(REF_FASTA)[0]}.dict",
+
+        # Final BAMs
+        expand(os.path.join(RESULTS_DIR, "bam", "{sample}_bqsr.bam"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "bam", "{sample}_bqsr.bam.bai"), sample=SAMPLES),
+
+        # Final calls
+        expand(os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.final.vcf.gz"), sample=CALLED_SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.final.vcf.gz.tbi"), sample=CALLED_SAMPLES),
+
+        # QC + metrics
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.flagstat.txt"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.samtools.stats.txt"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.dup_metrics.txt"), sample=SAMPLES),
+
+        # Coverage
+        expand(os.path.join(RESULTS_DIR, "coverage", "{sample}", "{sample}.mosdepth.summary.txt"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "coverage", "{sample}", "{sample}.regions.bed.gz"), sample=SAMPLES),
+
+        # Trimmed FASTQs
+        expand(os.path.join(RESULTS_DIR, "trimmed", "{sample}_R1.trimmed.fastq.gz"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "trimmed", "{sample}_R2.trimmed.fastq.gz"), sample=SAMPLES),
+        *(
+            [
+                expand(
+                    os.path.join(RESULTS_DIR, "trimmed", "{sample}_R1.repaired.fastq.gz"),
+                    sample=SAMPLES,
+                ),
+                expand(
+                    os.path.join(RESULTS_DIR, "trimmed", "{sample}_R2.repaired.fastq.gz"),
+                    sample=SAMPLES,
+                ),
+            ]
+            if PAIR_REPAIR_ENABLED
+            else []
+        ),
+        expand(os.path.join(RESULTS_DIR, "variants", "{sample}.variants.flagged.tsv"), sample=CALLED_SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "variants", "{sample}.clinical.tsv"), sample=CALLED_SAMPLES),
+
+        # FastQC reports (raw + trimmed)
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R1_fastqc.html"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R2_fastqc.html"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R1.trimmed_fastqc.html"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R2.trimmed_fastqc.html"), sample=SAMPLES),
+
+        # Reporting
+        os.path.join(RESULTS_DIR, "reports", "qc_summary.tsv"),
+        os.path.join(RESULTS_DIR, "reports", "qc_gates.tsv"),
+        os.path.join(RESULTS_DIR, "reports", "lod_by_bin.tsv"),
+        os.path.join(RESULTS_DIR, "reports", "run_manifest.json"),
+        os.path.join(RESULTS_DIR, "reports", "variant_summary.tsv"),
+        os.path.join(RESULTS_DIR, "reports", "ctdna_report.html"),
+        os.path.join(RESULTS_DIR, "reports", "multiqc", "multiqc_report.html")
+
+
+# ============================================================
+# Reference preparation
+# ============================================================
+rule index_reference_bwa:
+    input:
+        ref=REF_FASTA
+    output:
+        ref_bwt=f"{REF_FASTA}.bwt",
+        ref_amb=f"{REF_FASTA}.amb",
+        ref_ann=f"{REF_FASTA}.ann",
+        ref_pac=f"{REF_FASTA}.pac",
+        ref_sa=f"{REF_FASTA}.sa"
+    threads: 4
+    resources:
+        mem_mb=4000
+    conda: "../envs/bwa.yaml"
+    log:
+        os.path.join(LOGS_DIR, "ref", "bwa_index.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {log})
+        bwa index {input.ref} > {log} 2>&1
+        """
+
+
+rule index_reference_fasta:
+    input:
+        ref=REF_FASTA
+    output:
+        ref_fai=f"{REF_FASTA}.fai"
+    threads: 1
+    resources:
+        mem_mb=1000
+    conda: "../envs/samtools.yaml"
+    log:
+        os.path.join(LOGS_DIR, "ref", "faidx.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {log})
+        samtools faidx {input.ref} > {log} 2>&1
+        """
+
+
+rule create_reference_dict:
+    input:
+        ref=REF_FASTA
+    output:
+        dict=f"{os.path.splitext(REF_FASTA)[0]}.dict"
+    threads: 1
+    resources:
+        mem_mb=2000
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "ref", "CreateSequenceDictionary.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {log})
+        gatk CreateSequenceDictionary -R {input.ref} -O {output.dict} > {log} 2>&1
+        """
+
+
+# ============================================================
+# FASTQ QC + trimming
+# ============================================================
+rule fastqc_raw:
+    input:
+        r1=sample_r1,
+        r2=sample_r2
+    output:
+        html1=os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R1_fastqc.html"),
+        html2=os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R2_fastqc.html")
+    threads: config["resources"]["fastqc"]["threads"]
+    resources:
+        mem_mb=config["resources"]["fastqc"]["mem_mb"]
+    conda: "../envs/qc.yaml"
+    log:
+        os.path.join(LOGS_DIR, "fastqc", "{sample}.log")
+    params:
+        outdir=lambda wc, output: os.path.dirname(output.html1)
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log})
+        fastqc {input.r1} {input.r2} -o {params.outdir} > {log} 2>&1
+        """
+
+
+rule fastp:
+    input:
+        r1=pre_fastp_r1,
+        r2=pre_fastp_r2
+    output:
+        r1_trimmed=os.path.join(RESULTS_DIR, "trimmed", "{sample}_R1.trimmed.fastq.gz"),
+        r2_trimmed=os.path.join(RESULTS_DIR, "trimmed", "{sample}_R2.trimmed.fastq.gz"),
+        html=os.path.join(RESULTS_DIR, "trimmed", "{sample}_fastp.html"),
+        json=os.path.join(RESULTS_DIR, "trimmed", "{sample}_fastp.json")
+    threads: config["resources"]["fastp"]["threads"]
+    resources:
+        mem_mb=config["resources"]["fastp"]["mem_mb"]
+    conda: "../envs/fastp.yaml"
+    log:
+        os.path.join(LOGS_DIR, "fastp", "{sample}.log")
+    params:
+        outdir=lambda wc, output: os.path.dirname(output.r1_trimmed)
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log})
+
+        fastp -i {input.r1} -I {input.r2} \
+              -o {output.r1_trimmed} -O {output.r2_trimmed} \
+              -h {output.html} \
+              -j {output.json} \
+              -w {threads} \
+              > {log} 2>&1
+        """
+
+
+rule fastqc_trimmed:
+    input:
+        r1=os.path.join(RESULTS_DIR, "trimmed", "{sample}_R1.trimmed.fastq.gz"),
+        r2=os.path.join(RESULTS_DIR, "trimmed", "{sample}_R2.trimmed.fastq.gz")
+    output:
+        html1=os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R1.trimmed_fastqc.html"),
+        html2=os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R2.trimmed_fastqc.html")
+    threads: config["resources"]["fastqc"]["threads"]
+    resources:
+        mem_mb=config["resources"]["fastqc"]["mem_mb"]
+    conda: "../envs/qc.yaml"
+    log:
+        os.path.join(LOGS_DIR, "fastqc", "{sample}.trimmed.log")
+    params:
+        outdir=lambda wc, output: os.path.dirname(output.html1)
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log})
+        fastqc {input.r1} {input.r2} -o {params.outdir} > {log} 2>&1
+        """
+
+
+rule repair_pairs:
+    input:
+        r1=os.path.join(RESULTS_DIR, "trimmed", "{sample}_R1.trimmed.fastq.gz"),
+        r2=os.path.join(RESULTS_DIR, "trimmed", "{sample}_R2.trimmed.fastq.gz")
+    output:
+        r1=os.path.join(RESULTS_DIR, "trimmed", "{sample}_R1.repaired.fastq.gz"),
+        r2=os.path.join(RESULTS_DIR, "trimmed", "{sample}_R2.repaired.fastq.gz"),
+        singletons=os.path.join(RESULTS_DIR, "trimmed", "{sample}.singletons.fastq.gz")
+    threads: 1
+    resources:
+        mem_mb=2000
+    params:
+        max_singleton_fraction=PAIR_REPAIR_CFG.get("max_singleton_fraction", 0.02)
+    conda: "../envs/repair.yaml"
+    log:
+        os.path.join(LOGS_DIR, "repair", "{sample}.repair_pairs.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.r1})
+        mkdir -p $(dirname {log})
+
+        repair.sh \
+            in1={input.r1} in2={input.r2} \
+            out1={output.r1} out2={output.r2} \
+            outs={output.singletons} overwrite=t \
+            > {log} 2>&1
+
+        # Hard integrity check: repaired R1/R2 names must match exactly by record order.
+        paste \
+            <(gunzip -c {output.r1} | awk 'NR%4==1{{print}}' | sed -E 's/^@//; s/[[:space:]].*$//; s#/1$##') \
+            <(gunzip -c {output.r2} | awk 'NR%4==1{{print}}' | sed -E 's/^@//; s/[[:space:]].*$//; s#/2$##') | \
+        awk 'BEGIN{{ok=1}} $1 != $2 {{ok=0; print "MISMATCH\t"$1"\t"$2; exit 1}} END{{if (ok==1) print "PAIR_NAME_CHECK\tPASS"}}' \
+            >> {log}
+
+        n_r1=$(gunzip -c {output.r1} | awk 'END{{print NR/4}}')
+        n_singletons=$(gunzip -c {output.singletons} | awk 'END{{print NR/4}}')
+        if [ "$n_r1" -eq 0 ]; then
+            echo "No repaired read pairs remained after repair." >> {log}
+            exit 1
+        fi
+        frac=$(awk -v s="$n_singletons" -v p="$n_r1" 'BEGIN{{print s/p}}')
+        echo "repaired_pairs=$n_r1 singletons=$n_singletons singleton_fraction=$frac" >> {log}
+        awk -v f="$frac" -v t="{params.max_singleton_fraction}" 'BEGIN{{if (f>t) exit 1}}' || {{
+            echo "Singleton fraction exceeds threshold: $frac > {params.max_singleton_fraction}" >> {log}
+            exit 1
+        }}
+        """
+
+
+# Optional UMI extraction branch. Downstream rules consume these only if assay.umi.enabled=true.
+rule umi_extract:
+    input:
+        r1=sample_r1,
+        r2=sample_r2
+    output:
+        r1_umi=os.path.join(RESULTS_DIR, "umi", "{sample}_R1.umi.fastq.gz"),
+        r2_umi=os.path.join(RESULTS_DIR, "umi", "{sample}_R2.umi.fastq.gz")
+    threads: 1
+    resources:
+        mem_mb=2000
+    params:
+        bc_pattern=UMI_CFG.get("bc_pattern", "NNNNNNNN"),
+        outdir=lambda wc, output: os.path.dirname(output.r1_umi)
+    conda: "../envs/umi_tools.yaml"
+    log:
+        os.path.join(LOGS_DIR, "umi", "{sample}.extract.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log})
+
+        umi_tools extract \
+            --extract-method=string \
+            --bc-pattern={params.bc_pattern} \
+            --stdin {input.r1} \
+            --stdout {output.r1_umi} \
+            --read2-in {input.r2} \
+            --read2-out={output.r2_umi} \
+            > {log} 2>&1
+        """
+
+
+# ============================================================
+# Alignment + BAM preprocessing
+# ============================================================
+rule align_bwa:
+    input:
+        r1=align_r1,
+        r2=align_r2,
+        ref=REF_FASTA
+    output:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.aligned.bam")
+    log:
+        os.path.join(LOGS_DIR, "align", "{sample}.bwa_mem.log")
+    benchmark:
+        os.path.join(BENCH_DIR, "align", "{sample}.tsv")
+    threads: config["resources"]["bwa_mem"]["threads"]
+    resources:
+        mem_mb=config["resources"]["bwa_mem"]["mem_mb"]
+    conda: "../envs/bwa.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.bam})
+        mkdir -p $(dirname {log})
+
+        bwa mem -t {threads} {input.ref} {input.r1} {input.r2} 2> {log} | \
+        samtools view -@ {threads} -b -o {output.bam} -
+        """
+
+
+rule add_read_groups:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.aligned.bam")
+    output:
+        bam=temp(os.path.join(RESULTS_DIR, "bam", "{sample}.rg.bam"))
+    threads: 1
+    resources:
+        mem_mb=8000
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "gatk", "{sample}.AddOrReplaceReadGroups.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.bam})
+        mkdir -p $(dirname {log})
+
+        gatk --java-options "-Xmx{resources.mem_mb}m" AddOrReplaceReadGroups \
+            -I {input.bam} \
+            -O {output.bam} \
+            -RGID {wildcards.sample} \
+            -RGLB lib1 \
+            -RGPL ILLUMINA \
+            -RGPU unit1 \
+            -RGSM {wildcards.sample} \
+            > {log} 2>&1
+        """
+
+
+rule sort_bam:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.rg.bam")
+    output:
+        bam=temp(os.path.join(RESULTS_DIR, "bam", "{sample}.sorted.bam")),
+        bai=temp(os.path.join(RESULTS_DIR, "bam", "{sample}.sorted.bam.bai"))
+    threads: config["resources"]["samtools_sort"]["threads"]
+    resources:
+        mem_mb=config["resources"]["samtools_sort"]["mem_mb"]
+    conda: "../envs/samtools.yaml"
+    log:
+        os.path.join(LOGS_DIR, "samtools", "{sample}.sort_bam.log")
+    benchmark:
+        os.path.join(BENCH_DIR, "sort", "{sample}.txt")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.bam})
+        mkdir -p $(dirname {log})
+
+        samtools sort -@ {threads} -o {output.bam} {input.bam} > {log} 2>&1
+        samtools index -@ {threads} {output.bam} >> {log} 2>&1
+        """
+
+
+rule markdup:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.sorted.bam")
+    output:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.dedup.bam"),
+        bai=os.path.join(RESULTS_DIR, "bam", "{sample}.dedup.bai"),
+        metrics=os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.dup_metrics.txt")
+    threads: 1
+    resources:
+        mem_mb=16000
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "gatk", "{sample}.MarkDuplicates.log")
+    benchmark:
+        os.path.join(BENCH_DIR, "markdup", "{sample}.txt")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.bam})
+        mkdir -p $(dirname {output.metrics})
+        mkdir -p $(dirname {log})
+
+        gatk --java-options "-Xmx{resources.mem_mb}m" MarkDuplicates \
+            -I {input.bam} \
+            -O {output.bam} \
+            -M {output.metrics} \
+            --CREATE_INDEX true \
+            > {log} 2>&1
+
+        test -s {output.bam}
+        test -s {output.bai}
+        test -s {output.metrics}
+        """
+
+
+# ============================================================
+# Alignment QC
+# ============================================================
+rule samtools_flagstat:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.dedup.bam")
+    output:
+        os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.flagstat.txt")
+    threads: 2
+    resources:
+        mem_mb=1000
+    conda: "../envs/samtools.yaml"
+    log:
+        os.path.join(LOGS_DIR, "samtools", "{sample}.flagstat.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output})
+        mkdir -p $(dirname {log})
+
+        samtools flagstat -@ {threads} {input.bam} > {output} 2> {log}
+        """
+
+
+rule samtools_stats:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.dedup.bam")
+    output:
+        os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.samtools.stats.txt")
+    threads: 2
+    resources:
+        mem_mb=1000
+    conda: "../envs/samtools.yaml"
+    log:
+        os.path.join(LOGS_DIR, "samtools", "{sample}.stats.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output})
+        mkdir -p $(dirname {log})
+
+        samtools stats -@ {threads} {input.bam} > {output} 2> {log}
+        """
+
+
+# ============================================================
+# Coverage (panel)
+# ============================================================
+rule mosdepth_panel:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.dedup.bam"),
+        bai=os.path.join(RESULTS_DIR, "bam", "{sample}.dedup.bai"),
+        bed=PANEL_BED
+    output:
+        summary=os.path.join(RESULTS_DIR, "coverage", "{sample}", "{sample}.mosdepth.summary.txt"),
+        regions=os.path.join(RESULTS_DIR, "coverage", "{sample}", "{sample}.regions.bed.gz"),
+        regions_csi=os.path.join(RESULTS_DIR, "coverage", "{sample}", "{sample}.regions.bed.gz.csi")
+    threads: 4
+    resources:
+        mem_mb=8000
+    conda: "../envs/mosdepth.yaml"
+    log:
+        os.path.join(LOGS_DIR, "mosdepth", "{sample}.log")
+    params:
+        outdir=lambda wc: os.path.join(RESULTS_DIR, "coverage", wc.sample),
+        prefix=lambda wc: os.path.join(RESULTS_DIR, "coverage", wc.sample, wc.sample)
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log})
+
+        # mosdepth prefix determines filenames
+        prefix={params.prefix}
+
+        mosdepth -t {threads} -b {input.bed} $prefix {input.bam} > {log} 2>&1
+
+        test -s {output.summary}
+        test -s {output.regions}
+        """
+
+
+# ============================================================
+# BQSR
+# ============================================================
+rule base_recalibrator:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.dedup.bam"),
+        ref=REF_FASTA,
+        dbsnp=DBSNP_VCF,
+        dbsnp_tbi=f"{DBSNP_VCF}.tbi",
+        mills=MILLS_VCF,
+        mills_tbi=f"{MILLS_VCF}.tbi"
+    output:
+        table=os.path.join(RESULTS_DIR, "bam", "{sample}_recal.table")
+    threads: config["resources"]["gatk"]["threads"]
+    resources:
+        mem_mb=config["resources"]["gatk"]["mem_mb"]
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "gatk", "{sample}.BaseRecalibrator.log")
+    benchmark:
+        os.path.join(BENCH_DIR, "bqsr", "{sample}.BaseRecalibrator.txt")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.table})
+        mkdir -p $(dirname {log})
+
+        gatk --java-options "-Xmx{resources.mem_mb}m" BaseRecalibrator \
+            -I {input.bam} \
+            -R {input.ref} \
+            --known-sites {input.dbsnp} \
+            --known-sites {input.mills} \
+            -O {output.table} \
+            > {log} 2>&1
+
+        test -s {output.table}
+        """
+
+
+rule apply_bqsr:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}.dedup.bam"),
+        bai=os.path.join(RESULTS_DIR, "bam", "{sample}.dedup.bai"),
+        ref=REF_FASTA,
+        table=os.path.join(RESULTS_DIR, "bam", "{sample}_recal.table"),
+    output:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}_bqsr.bam"),
+        bai=os.path.join(RESULTS_DIR, "bam", "{sample}_bqsr.bam.bai"),
+    threads: config["resources"]["gatk"]["threads"]
+    resources:
+        mem_mb=config["resources"]["gatk"]["mem_mb"]
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "gatk", "{sample}.ApplyBQSR.log")
+    shell:
+        r"""
+        set -euo pipefail
+
+        mkdir -p $(dirname {output.bam})
+        mkdir -p $(dirname {log})
+
+        if grep -q "^#RG" {input.table}; then
+            gatk --java-options "-Xmx{resources.mem_mb}m" ApplyBQSR \
+                -R {input.ref} \
+                -I {input.bam} \
+                --bqsr-recal-file {input.table} \
+                -O {output.bam} \
+                --create-output-bam-index true \
+                &> {log}
+        else
+            echo "No read groups found in recal table, skipping BQSR" > {log}
+            cp {input.bam} {output.bam}
+            cp {input.bai} {output.bai}
+        fi
+
+        test -s {output.bam}
+        test -s {output.bai}
+        """
+
+
+# ============================================================
+# Somatic calling (Mutect2)
+# ============================================================
+rule mutect2:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}_bqsr.bam"),
+        bai=os.path.join(RESULTS_DIR, "bam", "{sample}_bqsr.bam.bai"),
+        normal_bams=mutect2_normal_bams,
+        normal_bais=mutect2_normal_bais,
+        ref=REF_FASTA,
+        germline=GERMLINE_RESOURCE,
+        germline_tbi=f"{GERMLINE_RESOURCE}.tbi",
+        pon=PON_VCF,
+        pon_tbi=f"{PON_VCF}.tbi",
+        intervals=PANEL_BED
+    output:
+        vcf=os.path.join(RESULTS_DIR, "mutect2", "{sample}.unfiltered.vcf.gz"),
+        vcf_tbi=os.path.join(RESULTS_DIR, "mutect2", "{sample}.unfiltered.vcf.gz.tbi"),
+        stats=os.path.join(RESULTS_DIR, "mutect2", "{sample}.unfiltered.vcf.gz.stats"),
+        f1r2=os.path.join(RESULTS_DIR, "mutect2", "{sample}.f1r2.tar.gz")
+    threads: config["resources"]["mutect2"]["threads"]
+    resources:
+        mem_mb=config["resources"]["mutect2"]["mem_mb"]
+    params:
+        normal_args=mutect2_normal_args,
+        outdir=lambda wc, output: os.path.dirname(output.vcf)
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "gatk", "{sample}.Mutect2.log")
+    benchmark:
+        os.path.join(BENCH_DIR, "mutect2", "{sample}.txt")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log})
+
+        gatk --java-options "-Xmx{resources.mem_mb}m" Mutect2 \
+            -R {input.ref} \
+            -I {input.bam} \
+            --tumor-sample {wildcards.sample} \
+            {params.normal_args} \
+            -L {input.intervals} \
+            --germline-resource {input.germline} \
+            --panel-of-normals {input.pon} \
+            --native-pair-hmm-threads {threads} \
+            --f1r2-tar-gz {output.f1r2} \
+            -O {output.vcf} \
+            > {log} 2>&1
+        """
+
+
+rule learn_read_orientation_model:
+    input:
+        f1r2=os.path.join(RESULTS_DIR, "mutect2", "{sample}.f1r2.tar.gz")
+    output:
+        artifact=os.path.join(RESULTS_DIR, "mutect2", "{sample}.read-orientation-model.tar.gz")
+    threads: 1
+    resources:
+        mem_mb=config["resources"]["gatk"]["mem_mb"]
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "gatk", "{sample}.LearnReadOrientationModel.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {log})
+
+        gatk --java-options "-Xmx{resources.mem_mb}m" LearnReadOrientationModel \
+            -I {input.f1r2} \
+            -O {output.artifact} \
+            > {log} 2>&1
+        """
+
+
+rule get_pileup_summaries:
+    input:
+        bam=os.path.join(RESULTS_DIR, "bam", "{sample}_bqsr.bam"),
+        bai=os.path.join(RESULTS_DIR, "bam", "{sample}_bqsr.bam.bai"),
+        ref=REF_FASTA,
+        common=COMMON_VARIANTS,
+        common_tbi=f"{COMMON_VARIANTS}.tbi",
+        intervals=PANEL_BED
+    output:
+        os.path.join(RESULTS_DIR, "mutect2", "{sample}.pileups.table")
+    threads: config["resources"]["gatk"]["threads"]
+    resources:
+        mem_mb=config["resources"]["gatk"]["mem_mb"]
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "gatk", "{sample}.GetPileupSummaries.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output})
+        mkdir -p $(dirname {log})
+
+        gatk --java-options "-Xmx{resources.mem_mb}m" GetPileupSummaries \
+            -R {input.ref} \
+            -I {input.bam} \
+            -V {input.common} \
+            -L {input.intervals} \
+            -O {output} \
+            > {log} 2>&1
+        """
+
+
+rule calculate_contamination:
+    input:
+        pileups=os.path.join(RESULTS_DIR, "mutect2", "{sample}.pileups.table")
+    output:
+        contamination=os.path.join(RESULTS_DIR, "mutect2", "{sample}.contamination.table"),
+        segments=os.path.join(RESULTS_DIR, "mutect2", "{sample}.segments.table")
+    threads: 1
+    resources:
+        mem_mb=config["resources"]["gatk"]["mem_mb"]
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "gatk", "{sample}.CalculateContamination.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {log})
+
+        gatk --java-options "-Xmx{resources.mem_mb}m" CalculateContamination \
+            -I {input.pileups} \
+            -O {output.contamination} \
+            --tumor-segmentation {output.segments} \
+            > {log} 2>&1
+        """
+
+
+rule filter_mutect:
+    input:
+        ref=REF_FASTA,
+        vcf=os.path.join(RESULTS_DIR, "mutect2", "{sample}.unfiltered.vcf.gz"),
+        vcf_tbi=os.path.join(RESULTS_DIR, "mutect2", "{sample}.unfiltered.vcf.gz.tbi"),
+        stats=os.path.join(RESULTS_DIR, "mutect2", "{sample}.unfiltered.vcf.gz.stats"),
+        contamination=os.path.join(RESULTS_DIR, "mutect2", "{sample}.contamination.table"),
+        segments=os.path.join(RESULTS_DIR, "mutect2", "{sample}.segments.table"),
+        artifact=os.path.join(RESULTS_DIR, "mutect2", "{sample}.read-orientation-model.tar.gz")
+    output:
+        filtered_vcf=os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.vcf.gz"),
+        filtered_vcf_tbi=os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.vcf.gz.tbi")
+    threads: 1
+    resources:
+        mem_mb=config["resources"]["gatk"]["mem_mb"]
+    conda: "../envs/gatk.yaml"
+    log:
+        os.path.join(LOGS_DIR, "gatk", "{sample}.FilterMutectCalls.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {log})
+
+        gatk --java-options "-Xmx{resources.mem_mb}m" FilterMutectCalls \
+            -R {input.ref} \
+            -V {input.vcf} \
+            --stats {input.stats} \
+            --contamination-table {input.contamination} \
+            --tumor-segmentation {input.segments} \
+            --ob-priors {input.artifact} \
+            -O {output.filtered_vcf} \
+            > {log} 2>&1
+        """
+
+
+rule hard_filter_mutect:
+    input:
+        vcf=os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.vcf.gz"),
+        vcf_tbi=os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.vcf.gz.tbi")
+    output:
+        filtered_vcf=os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.final.vcf.gz"),
+        filtered_vcf_tbi=os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.final.vcf.gz.tbi")
+    threads: 1
+    resources:
+        mem_mb=2000
+    params:
+        pass_only=POSTFILTER_SETTINGS.get("pass_only", True),
+        min_dp=POSTFILTER_SETTINGS.get("min_dp", 100),
+        min_alt_reads=POSTFILTER_SETTINGS.get("min_alt_reads", 3),
+        min_af=POSTFILTER_SETTINGS.get("min_af", 0.005),
+    conda: "../envs/bcftools.yaml"
+    log:
+        os.path.join(LOGS_DIR, "bcftools", "{sample}.hard_filter_mutect.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.filtered_vcf})
+        mkdir -p $(dirname {log})
+
+        pass_flag=""
+        if [ "{params.pass_only}" = "True" ] || [ "{params.pass_only}" = "true" ]; then
+            pass_flag="-f PASS,."
+        fi
+
+        bcftools view \
+            -s {wildcards.sample} \
+            $pass_flag \
+            -i 'FORMAT/DP>={params.min_dp} && FORMAT/AD[0:1]>={params.min_alt_reads} && (FORMAT/AD[0:1]/FORMAT/DP)>={params.min_af}' \
+            -Oz \
+            -o {output.filtered_vcf} \
+            {input.vcf} \
+            > {log} 2>&1
+
+        tabix -f -p vcf {output.filtered_vcf} >> {log} 2>&1
+        """
+
+
+# ============================================================
+# Variant table + QC summary + HTML report
+# ============================================================
+rule variant_table:
+    input:
+        vcf=os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.final.vcf.gz"),
+        vcf_tbi=os.path.join(RESULTS_DIR, "mutect2", "{sample}.filtered.final.vcf.gz.tbi")
+    output:
+        tsv=os.path.join(RESULTS_DIR, "variants", "{sample}.variants.tsv")
+    threads: 1
+    resources:
+        mem_mb=2000
+    conda: "../envs/bcftools.yaml"
+    log:
+        os.path.join(LOGS_DIR, "bcftools", "{sample}.variants_table.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.tsv})
+        mkdir -p $(dirname {log})
+
+        # Extract a ctDNA-friendly minimal table
+        # Note: AD/AF fields depend on Mutect2 annotations; this is a safe default
+        bcftools query \
+            -H \
+            -f '%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%FILTER\t[%DP]\t[%AF]\n' \
+            {input.vcf} > {output.tsv} 2> {log}
+        """
+
+
+rule annotate_variant_flags:
+    input:
+        tsv=os.path.join(RESULTS_DIR, "variants", "{sample}.variants.tsv")
+    output:
+        tsv=os.path.join(RESULTS_DIR, "variants", "{sample}.variants.flagged.tsv")
+    threads: 1
+    resources:
+        mem_mb=1000
+    params:
+        orth_enabled=ORTHO_ENABLED,
+        orth_calls_dir=ORTHO_CFG.get("calls_dir", ""),
+        chip_enabled=CHIP_ENABLED,
+        chip_panel=CHIP_CFG.get("panel_tsv", ""),
+        wbc_enabled=WBC_ENABLED,
+        wbc_calls_dir=WBC_CFG.get("calls_dir", ""),
+        wbc_fail_on_support=WBC_CFG.get("fail_on_support", True),
+        normal_sample=lambda wc: NORMAL_BY_TUMOR.get(wc.sample, ""),
+        clinical_annotations_enabled=CLIN_ANN_ENABLED,
+        clinical_annotations_panel=CLIN_ANN_CFG.get("panel_tsv", ""),
+        min_dp=CLINICAL_GATES.get("min_dp", 100),
+        min_alt_reads=CLINICAL_GATES.get("min_alt_reads", 3),
+        min_af=CLINICAL_GATES.get("min_af", 0.005),
+        low_vaf_threshold=CLINICAL_GATES.get("low_vaf_threshold", 0.01),
+        require_orthogonal_low_vaf=CLINICAL_GATES.get("require_orthogonal_low_vaf", True),
+        chip_flag_action=CLINICAL_GATES.get("chip_flag_action", "review"),
+    conda: "../envs/python.yaml"
+    log:
+        os.path.join(LOGS_DIR, "reports", "{sample}.annotate_variant_flags.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.tsv})
+        mkdir -p $(dirname {log})
+
+        python scripts/annotate_variant_flags.py \
+            --input {input.tsv} \
+            --sample {wildcards.sample} \
+            --output {output.tsv} \
+            --orth-enabled {params.orth_enabled} \
+            --orth-calls-dir "{params.orth_calls_dir}" \
+            --chip-enabled {params.chip_enabled} \
+            --chip-panel "{params.chip_panel}" \
+            --wbc-enabled {params.wbc_enabled} \
+            --wbc-calls-dir "{params.wbc_calls_dir}" \
+            --wbc-fail-on-support {params.wbc_fail_on_support} \
+            --normal-sample "{params.normal_sample}" \
+            --clinical-annotations-enabled {params.clinical_annotations_enabled} \
+            --clinical-annotations-panel "{params.clinical_annotations_panel}" \
+            --min-dp {params.min_dp} \
+            --min-alt-reads {params.min_alt_reads} \
+            --min-af {params.min_af} \
+            --low-vaf-threshold {params.low_vaf_threshold} \
+            --require-orthogonal-low-vaf {params.require_orthogonal_low_vaf} \
+            --chip-flag-action "{params.chip_flag_action}" \
+            > {log} 2>&1
+        """
+
+
+rule clinical_variant_output:
+    input:
+        tsv=os.path.join(RESULTS_DIR, "variants", "{sample}.variants.flagged.tsv")
+    output:
+        tsv=os.path.join(RESULTS_DIR, "variants", "{sample}.clinical.tsv")
+    threads: 1
+    resources:
+        mem_mb=1000
+    params:
+        enabled=CLIN_OUT_CFG.get("enabled", True),
+        accepted_gates=",".join(CLIN_OUT_CFG.get("accepted_support_gates", ["PASS", "REVIEW"])),
+        include_only_annotated=CLIN_OUT_CFG.get("include_only_annotated", False),
+    conda: "../envs/python.yaml"
+    log:
+        os.path.join(LOGS_DIR, "reports", "{sample}.clinical_output_gate.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.tsv})
+        mkdir -p $(dirname {log})
+
+        python scripts/clinical_output_gate.py \
+            --input {input.tsv} \
+            --output {output.tsv} \
+            --enabled {params.enabled} \
+            --accepted-gates "{params.accepted_gates}" \
+            --include-only-annotated {params.include_only_annotated} \
+            > {log} 2>&1
+        """
+
+
+rule summarize_run:
+    input:
+        samples_tsv=SAMPLES_TSV,
+
+        variant_tables=expand(os.path.join(RESULTS_DIR, "variants", "{sample}.clinical.tsv"), sample=CALLED_SAMPLES),
+        flagstats=expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.flagstat.txt"), sample=CALLED_SAMPLES),
+        samtools_stats=expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.samtools.stats.txt"), sample=CALLED_SAMPLES),
+        dup_metrics=expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.dup_metrics.txt"), sample=CALLED_SAMPLES),
+        mosdepth_summaries=expand(os.path.join(RESULTS_DIR, "coverage", "{sample}", "{sample}.mosdepth.summary.txt"), sample=CALLED_SAMPLES),
+        contaminations=expand(os.path.join(RESULTS_DIR, "mutect2", "{sample}.contamination.table"), sample=CALLED_SAMPLES)
+
+    output:
+        qc=os.path.join(RESULTS_DIR, "reports", "qc_summary.tsv"),
+        variants=os.path.join(RESULTS_DIR, "reports", "variant_summary.tsv"),
+        html=os.path.join(RESULTS_DIR, "reports", "ctdna_report.html")
+
+    params:
+        variant_tables=lambda wc, input: ",".join(input.variant_tables),
+        flagstats=lambda wc, input: ",".join(input.flagstats),
+        samtools_stats=lambda wc, input: ",".join(input.samtools_stats),
+        dup_metrics=lambda wc, input: ",".join(input.dup_metrics),
+        mosdepth_summaries=lambda wc, input: ",".join(input.mosdepth_summaries),
+        contaminations=lambda wc, input: ",".join(input.contaminations),
+        results_dir=lambda wc, output: os.path.dirname(os.path.dirname(output.html)),
+
+    threads: 1
+    resources:
+        mem_mb=4000
+
+    conda: "../envs/python.yaml"
+
+    log:
+        os.path.join(LOGS_DIR, "reports", "summarize_run.log")
+
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.qc})
+        mkdir -p $(dirname {log})
+
+        python scripts/ctdna_report.py \
+            --samples-tsv {input.samples_tsv} \
+            --results-dir {params.results_dir} \
+            --variants-matrix {input.variant_tables} \
+            --qc {input.flagstats} \
+            --samtools-stats {input.samtools_stats} \
+            --dup-metrics {input.dup_metrics} \
+            --coverage {input.mosdepth_summaries} \
+            --contamination {input.contaminations} \
+            --out {output.html} \
+            --qc-out {output.qc} \
+            --variants-out {output.variants} \
+            > {log} 2>&1
+        """
+
+
+rule qc_gate_status:
+    input:
+        flagstats=expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.flagstat.txt"), sample=CALLED_SAMPLES),
+        dup_metrics=expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.dup_metrics.txt"), sample=CALLED_SAMPLES),
+        mosdepth_summaries=expand(os.path.join(RESULTS_DIR, "coverage", "{sample}", "{sample}.mosdepth.summary.txt"), sample=CALLED_SAMPLES),
+        contaminations=expand(os.path.join(RESULTS_DIR, "mutect2", "{sample}.contamination.table"), sample=CALLED_SAMPLES),
+    output:
+        tsv=os.path.join(RESULTS_DIR, "reports", "qc_gates.tsv")
+    threads: 1
+    resources:
+        mem_mb=2000
+    params:
+        samples_csv=",".join(CALLED_SAMPLES),
+        min_mapped_pct=QC_GATES.get("min_mapped_pct", 95.0),
+        min_mean_coverage=QC_GATES.get("min_mean_coverage", 200.0),
+        max_dup_fraction=QC_GATES.get("max_dup_fraction", 0.90),
+        max_contamination=QC_GATES.get("max_contamination", 0.02),
+        results_dir=lambda wc, output: os.path.dirname(os.path.dirname(output.tsv)),
+    conda: "../envs/python.yaml"
+    log:
+        os.path.join(LOGS_DIR, "reports", "qc_gate_status.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.tsv})
+        mkdir -p $(dirname {log})
+
+        python scripts/qc_gates.py \
+            --samples {params.samples_csv} \
+            --results-dir {params.results_dir} \
+            --min-mapped-pct {params.min_mapped_pct} \
+            --min-mean-coverage {params.min_mean_coverage} \
+            --max-dup-fraction {params.max_dup_fraction} \
+            --max-contamination {params.max_contamination} \
+            --out {output.tsv} \
+            > {log} 2>&1
+        """
+
+
+rule lod_by_bin:
+    input:
+        mosdepth_summaries=expand(
+            os.path.join(RESULTS_DIR, "coverage", "{sample}", "{sample}.mosdepth.summary.txt"),
+            sample=CALLED_SAMPLES
+        ),
+        contaminations=expand(
+            os.path.join(RESULTS_DIR, "mutect2", "{sample}.contamination.table"),
+            sample=CALLED_SAMPLES
+        )
+    output:
+        tsv=os.path.join(RESULTS_DIR, "reports", "lod_by_bin.tsv")
+    threads: 1
+    resources:
+        mem_mb=1000
+    params:
+        samples_csv=",".join(CALLED_SAMPLES),
+        results_dir=lambda wc, output: os.path.dirname(os.path.dirname(output.tsv)),
+        bins_json=json.dumps(LOD_CFG.get("bins", []), sort_keys=True),
+        min_alt_reads=CLINICAL_GATES.get("min_alt_reads", 3),
+        max_contamination=QC_GATES.get("max_contamination", 0.02),
+    conda: "../envs/python.yaml"
+    log:
+        os.path.join(LOGS_DIR, "reports", "lod_by_bin.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.tsv})
+        mkdir -p $(dirname {log})
+
+        python scripts/lod_by_bin.py \
+            --samples {params.samples_csv} \
+            --results-dir {params.results_dir} \
+            --bins-json '{params.bins_json}' \
+            --min-alt-reads {params.min_alt_reads} \
+            --max-contamination {params.max_contamination} \
+            --out {output.tsv} \
+            > {log} 2>&1
+        """
+
+
+rule run_manifest:
+    input:
+        qc=os.path.join(RESULTS_DIR, "reports", "qc_summary.tsv"),
+        qc_gates=os.path.join(RESULTS_DIR, "reports", "qc_gates.tsv"),
+        lod=os.path.join(RESULTS_DIR, "reports", "lod_by_bin.tsv"),
+        variants=os.path.join(RESULTS_DIR, "reports", "variant_summary.tsv"),
+        html=os.path.join(RESULTS_DIR, "reports", "ctdna_report.html")
+    output:
+        json=os.path.join(RESULTS_DIR, "reports", "run_manifest.json")
+    threads: 1
+    resources:
+        mem_mb=1000
+    params:
+        called_samples_csv=",".join(CALLED_SAMPLES),
+        all_samples_csv=",".join(SAMPLES),
+        config_json=json.dumps(config, sort_keys=True),
+    conda: "../envs/python.yaml"
+    log:
+        os.path.join(LOGS_DIR, "reports", "run_manifest.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output.json})
+        mkdir -p $(dirname {log})
+
+        python scripts/run_manifest.py \
+            --output {output.json} \
+            --called-samples {params.called_samples_csv} \
+            --all-samples {params.all_samples_csv} \
+            --config-json '{params.config_json}' \
+            > {log} 2>&1
+        """
+
+# ============================================================
+# MultiQC
+# ============================================================
+rule multiqc:
+    input:
+        # Ensure it waits for common report inputs
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R1_fastqc.html"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}_R1.trimmed_fastqc.html"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "trimmed", "{sample}_fastp.json"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.samtools.stats.txt"), sample=SAMPLES),
+        expand(os.path.join(RESULTS_DIR, "qc", "{sample}", "{sample}.dup_metrics.txt"), sample=SAMPLES)
+    output:
+        html=os.path.join(RESULTS_DIR, "reports", "multiqc", "multiqc_report.html")
+    threads: 1
+    resources:
+        mem_mb=2000
+    conda: "../envs/multiqc.yaml"
+    log:
+        os.path.join(LOGS_DIR, "multiqc", "multiqc.log")
+    params:
+        results_dir=lambda wc, output: os.path.dirname(os.path.dirname(os.path.dirname(output.html))),
+        outdir=lambda wc, output: os.path.dirname(output.html)
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log})
+
+        multiqc {params.results_dir} -o {params.outdir} > {log} 2>&1
+        """

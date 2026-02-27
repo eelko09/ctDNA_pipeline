@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CI tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install "snakemake==9.13.3" pyyaml
+
+      - name: Validate config schema/ranges
+        run: |
+          python tests/validate_config.py \
+            workflow/config.yaml \
+            tests/config.test.yaml \
+            tests/config.ci.yaml
+
+      - name: Validate synthetic low-VAF sensitivity bins
+        run: |
+          python tests/assert_sensitivity_bins.py \
+            --truth tests/truthset/synthetic_truth.tsv \
+            --calls tests/truthset/synthetic_calls.tsv \
+            --bin 0.001:0.005=0.60 \
+            --bin 0.005:0.010=0.80 \
+            --bin 0.010:0.050=0.95
+
+      - name: Snakemake dry-run (CI config)
+        run: |
+          snakemake -n -s workflow/Snakefile --configfile tests/config.ci.yaml --cores 1

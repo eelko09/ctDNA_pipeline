@@ -1,0 +1,121 @@
+# ============================================================
+# ctDNA / cfDNA Snakemake Pipeline Configuration (Test)
+# ============================================================
+
+samples_tsv: "tests/samples.tsv"
+
+# Toggle for quick testing (redirects paths to tests/)
+testing: true
+
+# ============================================================
+# References
+# ============================================================
+
+references:
+  # Primary reference (GRCh38 + decoy)
+  reference_fasta: "ref/grch38/Homo_sapiens_assembly38.fasta"
+
+  # Panel / capture intervals (TruSight Cancer)
+  panel_bed: "ref/grch38/TruSight_Cancer_TargetedRegions_v1.0.hg38.bed"
+
+  # Known sites (BQSR)
+  known_sites:
+    dbsnp: "ref/grch38/Homo_sapiens_assembly38.dbsnp138.vcf.gz"
+    mills_indels: "ref/grch38/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+
+  # Mutect2 germline resource
+  germline_resource: "ref/grch38/af-only-gnomad.hg38.vcf.gz"
+
+  # Common variants resource
+  common_variants: "ref/grch38/small_exac_common_3.hg38.vcf.gz"
+
+  # Panel of Normals (PoN)
+  pon_vcf: "ref/grch38/1000g_pon.hg38.vcf.gz"
+
+  # Optional: blacklist regions
+  blacklist_bed: "ref/grch38/hg38-blacklist.v2.bed"
+
+# HsMetrics test BEDs
+hs_metrics_baits: "ref/grch38/test_baits.bed"
+hs_metrics_targets: "ref/grch38/test_targets.bed"
+
+# ============================================================
+# Resources (threads + memory per rule) - optimized for testing
+# ============================================================
+
+resources:
+  # --------------------------
+  # QC
+  # --------------------------
+  fastqc:
+    threads: 1
+    mem_mb: 2000
+
+  multiqc:
+    threads: 1
+    mem_mb: 2000
+
+  # --------------------------
+  # Trimming
+  # --------------------------
+  fastp:
+    threads: 2
+    mem_mb: 4000
+
+  # --------------------------
+  # Reference / Indexing
+  # --------------------------
+  bwa_index:
+    threads: 4
+    mem_mb: 16000
+
+  # --------------------------
+  # Alignment + BAM processing
+  # --------------------------
+  bwa_mem:
+    threads: 2
+    mem_mb: 4000
+
+  samtools_sort:
+    threads: 2
+    mem_mb: 4000
+
+  # --------------------------
+  # Duplicate marking
+  # --------------------------
+  markdup:
+    threads: 1
+    mem_mb: 4000
+
+  # --------------------------
+  # GATK + Variant Calling
+  # --------------------------
+  gatk:
+    threads: 1
+    mem_mb: 8000
+    Xmx: "8"
+
+  mutect2:
+    threads: 1
+    mem_mb: 8000
+    Xmx: "8"
+
+  filter_mutect:
+    threads: 1
+    mem_mb: 8000
+    Xmx: "8"
+
+  # --------------------------
+  # Optional tools
+  # --------------------------
+  vep:
+    threads: 1
+    mem_mb: 4000
+
+  ichorcna:
+    threads: 1
+    mem_mb: 4000
+
+  msisensor2:
+    threads: 1
+    mem_mb: 2000

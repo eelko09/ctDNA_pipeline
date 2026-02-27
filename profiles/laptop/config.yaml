@@ -1,0 +1,16 @@
+# Run locally with sensible defaults
+# Usage:
+# snakemake --profile profiles/laptop -j 4
+
+cores: 4
+use-conda: true
+conda-frontend: mamba
+printshellcmds: true
+rerun-incomplete: true
+keep-going: true
+latency-wait: 60
+restart-times: 1
+
+# Default resources for rules that do not define mem_mb
+default-resources:
+  - mem_mb=16000

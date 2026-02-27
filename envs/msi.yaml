@@ -1,0 +1,7 @@
+name: msi
+channels:
+- conda-forge
+- bioconda
+dependencies:
+- msisensor2
+- samtools

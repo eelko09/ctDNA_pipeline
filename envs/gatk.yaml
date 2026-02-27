@@ -1,0 +1,14 @@
+name: gatk
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  # Core tools
+  - gatk4
+  - picard
+  - samtools
+  - htslib
+
+  # Java runtime required for GATK and Picard
+  - openjdk

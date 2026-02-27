@@ -1,0 +1,3 @@
+sample	type	R1_fastq	R2_fastq	normal_sample
+TUMOR	tumor	TUMOR_R1.fastq.gz	TUMOR_R2.fastq.gz	NORMAL
+NORMAL	normal	NORMAL_R1.fastq.gz	NORMAL_R2.fastq.gz	

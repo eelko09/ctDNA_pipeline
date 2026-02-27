@@ -1,0 +1,20 @@
+name: python
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11.8
+
+  # Core numerics
+  - numpy=1.26.4
+  - pandas=2.1.4
+  - jinja2
+
+  # Plotting
+  - matplotlib=3.8.2
+  - seaborn=0.13.1
+
+  # Notebooks
+  - jupyter=1.0.0
+  - notebook=7.0.6
+  - jupyterlab=4.0.9
+  - plotly

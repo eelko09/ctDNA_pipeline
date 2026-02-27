@@ -1,0 +1,91 @@
+samples_tsv: "tests/samples.tsv"
+testing: true
+
+references:
+  reference_fasta: "tests/ref/mock_reference.fa"
+  panel_bed: "tests/ref/mock_panel.bed"
+  known_sites:
+    dbsnp: "tests/ref/mock_dbsnp.vcf.gz"
+    mills_indels: "tests/ref/mock_mills.vcf.gz"
+  germline_resource: "tests/ref/mock_germline.vcf.gz"
+  common_variants: "tests/ref/mock_common.vcf.gz"
+  pon_vcf: "tests/ref/mock_pon.vcf.gz"
+  blacklist_bed: "tests/ref/mock_blacklist.bed"
+
+variant_calling:
+  mode: "auto"
+  mutect2:
+    min_allele_fraction: 0.001
+  postfilter:
+    pass_only: true
+    min_dp: 50
+    min_alt_reads: 2
+    min_af: 0.002
+
+qc_gates:
+  min_mapped_pct: 90.0
+  min_mean_coverage: 50.0
+  max_dup_fraction: 0.95
+  max_contamination: 0.05
+
+assay:
+  umi:
+    enabled: false
+    method: "umi_tools"
+    bc_pattern: "NNNNNNNN"
+  orthogonal:
+    enabled: false
+    calls_dir: "workflow/resources/orthogonal_calls"
+  chip:
+    enabled: false
+    panel_tsv: "workflow/resources/chip_hotspots.tsv"
+  wbc_filter:
+    enabled: false
+    calls_dir: "workflow/resources/wbc_calls"
+    fail_on_support: true
+
+clinical_annotations:
+  enabled: false
+  panel_tsv: "workflow/resources/clinical_annotations.tsv"
+
+clinical_output:
+  enabled: true
+  accepted_support_gates: ["PASS", "REVIEW"]
+  include_only_annotated: false
+
+clinical_support_gates:
+  min_dp: 50
+  min_alt_reads: 2
+  min_af: 0.002
+  low_vaf_threshold: 0.01
+  require_orthogonal_low_vaf: true
+  chip_flag_action: "review"
+
+lod:
+  bins:
+    - name: "0.1%-0.5%"
+      min_af: 0.001
+      max_af: 0.005
+    - name: "0.5%-1.0%"
+      min_af: 0.005
+      max_af: 0.01
+
+resources:
+  fastqc:
+    threads: 1
+    mem_mb: 1000
+  fastp:
+    threads: 1
+    mem_mb: 1000
+  bwa_mem:
+    threads: 1
+    mem_mb: 1000
+  samtools_sort:
+    threads: 1
+    mem_mb: 1000
+  gatk:
+    threads: 1
+    mem_mb: 2000
+  mutect2:
+    threads: 1
+    mem_mb: 2000
